@@ -1862,6 +1862,251 @@ def test_saved_v_new_vs_recomputed_v_new(dtype, scalar_gate):
     ), f"Mismatch in {name} between saved v_new and recomputed v_new"
 
 
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("use_qk_l2norm_in_kernel", [True, False])
+@pytest.mark.parametrize(
+    "h_qk,h,mb_arg", [(2, 8, None), (1, 4, None), (2, 8, 8)]
+)
+def test_native_qkv_conv_and_in_kernel_l2norm(
+    dtype, use_qk_l2norm_in_kernel, h_qk, h, mb_arg
+):
+  if jax.default_backend() != "tpu":
+    pytest.skip("TPU required")
+  from tokamax._src.ops.kda import pallas_mosaic_tpu_bwd_kernel as bwd_mod  # pylint: disable=g-import-not-at-top
+
+  b, t, k, v = 2, 128, 128, 128
+  chunk_size = 64
+  nt = t // chunk_size
+  repeats = h // h_qk
+  k_dim = h_qk * k
+  v_dim = h * v
+  mb = mb_arg
+  return_dh0 = mb_arg is not None
+
+  key = jax.random.PRNGKey(123)
+  k1, k2, k3, k4, k5, k6, k7 = jax.random.split(key, 7)
+  qkv_conv = jax.random.normal(k1, (b, t, 2 * k_dim + v_dim), dtype=dtype) * 0.2
+  g_hb = -jnp.abs(jax.random.uniform(k2, (h, b, t, 1), dtype=jnp.float32)) * 0.5
+  beta_hb = jax.random.uniform(k3, (h, b, t), dtype=jnp.float32) * 0.5
+  do_bthv = jax.random.normal(k4, (b, t, h, v), dtype=dtype) * 0.1
+  a_native = jnp.tril(
+      jax.random.normal(
+          k5, (b, nt, h, chunk_size, chunk_size), dtype=jnp.float32
+      )
+      * 0.05,
+      k=-1,
+  ) + jnp.eye(chunk_size, dtype=jnp.float32)
+  h_native = jax.random.normal(k6, (b, nt, h, k, v), dtype=jnp.float32) * 0.1
+  dht = (
+      jax.random.normal(k7, (b, 1, h, k, v), dtype=jnp.float32) * 0.1
+      if return_dh0
+      else None
+  )
+
+  q_raw = qkv_conv[:, :, :k_dim].reshape(b, t, h_qk, k).astype(jnp.float32)
+  k_raw = (
+      qkv_conv[:, :, k_dim : 2 * k_dim]
+      .reshape(b, t, h_qk, k)
+      .astype(jnp.float32)
+  )
+  v_raw = qkv_conv[:, :, 2 * k_dim :].reshape(b, t, h, v)
+
+  if use_qk_l2norm_in_kernel:
+    rstd_q = jax.lax.rsqrt(
+        jnp.sum(q_raw * q_raw, axis=-1, keepdims=True) + 1e-6
+    )
+    rstd_k = jax.lax.rsqrt(
+        jnp.sum(k_raw * k_raw, axis=-1, keepdims=True) + 1e-6
+    )
+    q_norm = q_raw * rstd_q
+    k_norm = k_raw * rstd_k
+    rstd_q_hb = rstd_q.transpose(2, 0, 1, 3)
+    rstd_k_hb = rstd_k.transpose(2, 0, 1, 3)
+  else:
+    q_norm, k_norm = q_raw, k_raw
+    rstd_q_hb = rstd_k_hb = None
+
+  q_hb = q_norm.transpose(2, 0, 1, 3).astype(dtype)
+  k_hb = k_norm.transpose(2, 0, 1, 3).astype(dtype)
+  v_hb = v_raw.transpose(2, 0, 1, 3).astype(dtype)
+  do_hb = do_bthv.transpose(2, 0, 1, 3).astype(dtype)
+
+  dq_hb, dk_hb, dv_hb, db_ref, dg_ref, dh0_ref = (
+      bwd_mod._fused_dhu_wy_intra_cumsum_pallas_jit(
+          q_hb,
+          k_hb,
+          v_hb,
+          None,
+          None,
+          None,
+          None,
+          g_hb,
+          beta_hb,
+          a_native,
+          h_native,
+          do_hb,
+          None,
+          None,
+          dht,
+          k**-0.5,
+          chunk_size=chunk_size,
+          mini_batch=mb,
+          use_exp2=True,
+          per_channel_gate=False,
+          return_dh0=return_dh0,
+          gqa_repeats=repeats,
+          rstd_q=rstd_q_hb,
+          rstd_k=rstd_k_hb,
+          dqkv_dtype=dtype,
+          native_state_layout=True,
+      )
+  )
+  dy_conv_ref = jnp.concatenate(
+      [
+          dq_hb.transpose(1, 2, 0, 3).reshape(b, t, k_dim),
+          dk_hb.transpose(1, 2, 0, 3).reshape(b, t, k_dim),
+          dv_hb.transpose(1, 2, 0, 3).reshape(b, t, v_dim),
+      ],
+      axis=-1,
+  )
+
+  dy_conv_actual, _, _, db_actual, dg_actual, dh0_actual = (
+      bwd_mod._fused_dhu_wy_intra_cumsum_pallas_jit(
+          None,
+          None,
+          None,
+          None,
+          None,
+          None,
+          None,
+          g_hb,
+          beta_hb,
+          a_native,
+          h_native,
+          do_bthv,
+          None,
+          None,
+          dht,
+          k**-0.5,
+          chunk_size=chunk_size,
+          mini_batch=mb,
+          use_exp2=True,
+          per_channel_gate=False,
+          return_dh0=return_dh0,
+          gqa_repeats=repeats,
+          dqkv_dtype=dtype,
+          native_state_layout=True,
+          qkv_conv=qkv_conv,
+          use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+      )
+  )
+
+  atol = 1e-3 if dtype == jnp.bfloat16 else 1e-5
+  rtol = 1e-2 if dtype == jnp.bfloat16 else 1e-5
+  assert compare_tensor(
+      "dy_conv", dy_conv_actual, dy_conv_ref, atol=atol, rtol=rtol, dtype=dtype
+  )
+  assert compare_tensor(
+      "db", db_actual, db_ref, atol=atol, rtol=rtol, dtype=jnp.float32
+  )
+  assert compare_tensor(
+      "dg", dg_actual, dg_ref, atol=atol, rtol=rtol, dtype=jnp.float32
+  )
+  assert compare_tensor(
+      "dh0", dh0_actual, dh0_ref, atol=atol, rtol=rtol, dtype=jnp.float32
+  )
+
+
+def test_native_qkv_conv_pallas_interpret(monkeypatch):
+  if jax.default_backend() not in ("tpu", "cpu"):
+    pytest.skip("TPU or CPU interpret required")
+  from tokamax._src.ops.kda import pallas_mosaic_tpu_bwd_kernel as bwd_mod  # pylint: disable=g-import-not-at-top
+
+  b, t, h_qk, h, k, v = 1, 64, 1, 4, 128, 128
+  qkv_conv = jnp.zeros((b, t, 2 * h_qk * k + h * v), dtype=jnp.bfloat16)
+  g_hb = jnp.zeros((h, b, t, 1), dtype=jnp.float32)
+  beta_hb = jnp.zeros((h, b, t), dtype=jnp.float32)
+  do_bthv = jnp.zeros((b, t, h, v), dtype=jnp.bfloat16)
+  a_native = jnp.zeros((b, 1, h, 64, 64), dtype=jnp.float32)
+  h_native = jnp.zeros((b, 1, h, k, v), dtype=jnp.float32)
+
+  monkeypatch.setenv("PALLAS_INTERPRET", "1")
+  jax.clear_caches()
+  with pytest.raises(NotImplementedError, match="interpret"):
+    bwd_mod._fused_dhu_wy_intra_cumsum_pallas_jit(
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        g_hb,
+        beta_hb,
+        a_native,
+        h_native,
+        do_bthv,
+        None,
+        None,
+        None,
+        k**-0.5,
+        chunk_size=64,
+        mini_batch=4,
+        use_exp2=True,
+        per_channel_gate=False,
+        return_dh0=False,
+        gqa_repeats=h // h_qk,
+        dqkv_dtype=jnp.bfloat16,
+        native_state_layout=True,
+        qkv_conv=qkv_conv,
+        use_qk_l2norm_in_kernel=True,
+    )
+  jax.clear_caches()
+
+
+def test_native_qkv_conv_rejects_wrong_do_shape():
+  if jax.default_backend() not in ("tpu", "cpu"):
+    pytest.skip("TPU or CPU interpret required")
+  from tokamax._src.ops.kda import pallas_mosaic_tpu_bwd_kernel as bwd_mod  # pylint: disable=g-import-not-at-top
+
+  b, t, h_qk, h, k, v = 2, 64, 1, 4, 128, 128
+  qkv_conv = jnp.zeros((b, t, 2 * h_qk * k + h * v), dtype=jnp.bfloat16)
+  g_hb = jnp.zeros((h, b, t, 1), dtype=jnp.float32)
+  beta_hb = jnp.zeros((h, b, t), dtype=jnp.float32)
+  a_native = jnp.zeros((b, 1, h, 64, 64), dtype=jnp.float32)
+  h_native = jnp.zeros((b, 1, h, k, v), dtype=jnp.float32)
+  wrong_do_hb = jnp.zeros((h, b, t, v), dtype=jnp.bfloat16)
+
+  with pytest.raises(AssertionError, match="do.shape"):
+    bwd_mod._fused_dhu_wy_intra_cumsum_pallas_jit(
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        g_hb,
+        beta_hb,
+        a_native,
+        h_native,
+        wrong_do_hb,
+        None,
+        None,
+        None,
+        k**-0.5,
+        chunk_size=64,
+        use_exp2=True,
+        per_channel_gate=False,
+        return_dh0=False,
+        gqa_repeats=h // h_qk,
+        dqkv_dtype=jnp.bfloat16,
+        native_state_layout=True,
+        qkv_conv=qkv_conv,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+
 class _ShardPlugin:
 
   def pytest_collection_modifyitems(self, items):
