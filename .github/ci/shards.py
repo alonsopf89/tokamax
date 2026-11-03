@@ -159,7 +159,7 @@ EXCLUDED_TESTS = (
 # installs; every version in `older_jaxs()` gets a compat rerun
 # on each of `COMPAT_RUNNERS`, so that a downstream still on
 # the older release is not broken by a change that only works on the newer one.
-JAX_VERSIONS = ('0.11.2', '0.11.1')
+JAX_VERSIONS = ('0.12.0', '0.11.2')
 
 # TODO: Enable the backward compatibility test for GPU kernels by
 # adding 'linux-x86-a3-8g-h100-1gpu' to COMPAT_RUNNERS.
